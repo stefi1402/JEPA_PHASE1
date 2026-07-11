@@ -98,26 +98,58 @@ def generate_dataset(
 
     If p_range is given, each sequence draws its own p ~ Uniform(p_range).
     Otherwise every sequence uses the fixed `p`. Same logic for k_range/k.
+
+    Implementation note
+    --------------------
+    All N sequences are simulated together, vectorized across the batch
+    dimension with numpy. Only the seq_len (time) axis remains a Python
+    loop, since each step depends on the previous one; every other axis
+    (sequences, and frame construction) is done with array ops. This
+    turns an O(n_sequences * seq_len) pure-Python loop into an
+    O(seq_len) loop of vectorized O(n_sequences) numpy operations, which
+    is dramatically faster for the batch sizes used here (thousands of
+    sequences).
     """
     rng = np.random.default_rng(seed)
+    N = n_sequences
 
-    all_frames = np.zeros((n_sequences, seq_len, d, d), dtype=np.float32)
-    all_positions = np.zeros((n_sequences, seq_len, 2), dtype=np.int64)
-    all_p = np.zeros((n_sequences,), dtype=np.float32)
-    all_k = np.zeros((n_sequences,), dtype=np.float32)
+    # Per-sequence p / k, drawn once for the whole batch.
+    if p_range is not None:
+        all_p = rng.uniform(p_range[0], p_range[1], size=N).astype(np.float32)
+    else:
+        all_p = np.full(N, p, dtype=np.float32)
 
-    for i in range(n_sequences):
-        p_i = rng.uniform(*p_range) if p_range is not None else p
-        k_i = int(rng.integers(k_range[0], k_range[1] + 1)) if k_range is not None else k
+    if k_range is not None:
+        all_k = rng.integers(k_range[0], k_range[1] + 1, size=N).astype(np.float32)
+    else:
+        all_k = np.full(N, k, dtype=np.float32)
+    k_int = all_k.astype(np.int64)
 
-        frames, positions = simulate_sequence(
-            d=d, p=p_i, k=k_i, seq_len=seq_len,
-            step_size_random=step_size_random, rng=rng,
-        )
-        all_frames[i] = frames
-        all_positions[i] = positions
-        all_p[i] = p_i
-        all_k[i] = k_i
+    # Pre-draw all the per-step randomness for the whole batch at once.
+    move_mask = rng.random((seq_len, N)) < all_p[None, :]          # (T, N)
+    dir_idx = rng.integers(0, 4, size=(seq_len, N))                # (T, N)
+    if step_size_random:
+        # step ~ Uniform{1, ..., k_i} per sequence, per timestep.
+        step = np.empty((seq_len, N), dtype=np.int64)
+        low = np.ones(N, dtype=np.int64)
+        high = k_int + 1
+        for t in range(seq_len):
+            step[t] = rng.integers(low, high)
+    else:
+        step = np.broadcast_to(k_int, (seq_len, N)).astype(np.int64)
+
+    all_positions = np.empty((N, seq_len, 2), dtype=np.int64)
+    all_frames = np.full((N, seq_len, d, d), -1.0, dtype=np.float32)
+    seq_idx = np.arange(N)
+
+    pos = np.stack([rng.integers(0, d, size=N), rng.integers(0, d, size=N)], axis=1)  # (N, 2)
+    for t in range(seq_len):
+        all_positions[:, t] = pos
+        all_frames[seq_idx, t, pos[:, 0], pos[:, 1]] = 1.0
+
+        delta = DIRS[dir_idx[t]] * step[t][:, None]                # (N, 2)
+        moved = np.where(move_mask[t][:, None], pos + delta, pos)
+        pos = np.clip(moved, 0, d - 1)
 
     return SequenceBatch(frames=all_frames, positions=all_positions,
                           p_values=all_p, k_values=all_k, d=d)

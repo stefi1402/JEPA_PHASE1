@@ -61,6 +61,14 @@ class DotTransformer(nn.Module):
         self.pixel_pos_emb = nn.Embedding(self.n_cells, d_model)
         self.frame_pos_emb = nn.Embedding(max_frames, d_model)
 
+        # Static index buffers (move with .to(device)/.cuda(), never rebuilt
+        # per forward call). pixel_ids doesn't depend on the batch or T, so
+        # it's precomputed once; frame ids do depend on T so we still slice
+        # arange for those, but from a cheap 1D buffer instead of building
+        # a fresh tensor+expand every call.
+        self.register_buffer("_pixel_ids", torch.arange(self.n_cells), persistent=False)
+        self.register_buffer("_frame_ids_all", torch.arange(max_frames), persistent=False)
+
         # learned "query" embedding used for every future-frame query token
         self.future_query_emb = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
@@ -98,25 +106,24 @@ class DotTransformer(nn.Module):
             k_pred:     (B,)  (only if predict_pk)
         """
         B, T, d, _ = frames_obs.shape
-        device = frames_obs.device
         n_cells = d * d
 
         pixels = frames_obs.view(B, T, n_cells, 1)  # (B, T, n_cells, 1)
         tok = self.value_proj(pixels)                # (B, T, n_cells, d_model)
 
-        pixel_ids = torch.arange(n_cells, device=device).view(1, 1, n_cells)
-        pixel_ids = pixel_ids.expand(B, T, n_cells)
+        # Broadcast (no .expand()/materialization needed): embedding lookup
+        # on a (1,1,n_cells) index already broadcasts against (B,T,n_cells,d_model)
+        # when added, so skip the explicit .expand() copies.
+        pixel_ids = self._pixel_ids.view(1, 1, n_cells)
         tok = tok + self.pixel_pos_emb(pixel_ids)
 
-        frame_ids_obs = torch.arange(T, device=device).view(1, T, 1)
-        frame_ids_obs = frame_ids_obs.expand(B, T, n_cells)
+        frame_ids_obs = self._frame_ids_all[:T].view(1, T, 1)
         tok = tok + self.frame_pos_emb(frame_ids_obs)
 
         tok = tok.reshape(B, T * n_cells, self.d_model)  # (B, T*n_cells, d_model)
 
         # future query tokens
-        fq_frame_ids = torch.arange(T, T + t_future, device=device).view(1, t_future)
-        fq_frame_ids = fq_frame_ids.expand(B, t_future)
+        fq_frame_ids = self._frame_ids_all[T:T + t_future].view(1, t_future)
         fq = self.future_query_emb.expand(B, t_future, self.d_model)
         fq = fq + self.frame_pos_emb(fq_frame_ids)
 

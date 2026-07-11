@@ -73,10 +73,15 @@ def run_training(
     seed: int = 0,
     device: str = None,
     viz_every: int = 5,
+    num_workers: int = 2,
+    amp: bool = True,
 ):
     os.makedirs(out_dir, exist_ok=True)
     torch.manual_seed(seed)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    use_cuda = device.startswith("cuda")
+    # AMP only helps (and is only supported the same way) on CUDA.
+    amp_enabled = amp and use_cuda
 
     batch = load_dataset(data_path)
     dataset = WalkDataset(batch, t_obs, t_future)
@@ -87,8 +92,13 @@ def run_training(
         dataset, [n_train, n_val], generator=torch.Generator().manual_seed(seed)
     )
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+    loader_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=use_cuda,
+        persistent_workers=num_workers > 0,
+    )
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
     # quick sanity-check visualization of the raw data before training starts
     viz.plot_sample_sequences(
@@ -112,6 +122,7 @@ def run_training(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     ce = nn.CrossEntropyLoss()
     mse = nn.MSELoss()
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     history = {"train_loss": [], "val_loss": [], "val_xy_acc": []}
     if predict_pk:
@@ -121,61 +132,70 @@ def run_training(
     for epoch in range(1, epochs + 1):
         model.train()
         t0 = time.time()
-        total_loss = 0.0
+        # Accumulate on-device; a single .item() per epoch instead of one
+        # per batch avoids a GPU/CPU sync point on every training step.
+        total_loss = torch.zeros((), device=device)
         for frames_obs, pos_future, p_true, k_true in train_loader:
-            frames_obs = frames_obs.to(device)
-            pos_future = pos_future.to(device)
-            p_true = p_true.to(device)
-            k_true = k_true.to(device)
+            frames_obs = frames_obs.to(device, non_blocking=True)
+            pos_future = pos_future.to(device, non_blocking=True)
+            p_true = p_true.to(device, non_blocking=True)
+            k_true = k_true.to(device, non_blocking=True)
 
-            out = model(frames_obs, t_future)
-            row_loss = ce(out["row_logits"].reshape(-1, batch.d), pos_future[..., 0].reshape(-1))
-            col_loss = ce(out["col_logits"].reshape(-1, batch.d), pos_future[..., 1].reshape(-1))
-            loss = lambda_xy * (row_loss + col_loss)
-
-            if predict_pk:
-                loss = loss + lambda_p * mse(out["p_pred"], p_true)
-                loss = loss + lambda_k * mse(out["k_pred"], k_true)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * frames_obs.size(0)
-
-        train_loss = total_loss / len(train_set)
-
-        # ---- validation ----
-        model.eval()
-        val_loss_total, correct, count = 0.0, 0, 0
-        p_abs_err, k_abs_err, n_pk = 0.0, 0.0, 0
-        with torch.no_grad():
-            for frames_obs, pos_future, p_true, k_true in val_loader:
-                frames_obs = frames_obs.to(device)
-                pos_future = pos_future.to(device)
-                p_true = p_true.to(device)
-                k_true = k_true.to(device)
-
+            with torch.autocast(device_type="cuda", enabled=amp_enabled):
                 out = model(frames_obs, t_future)
                 row_loss = ce(out["row_logits"].reshape(-1, batch.d), pos_future[..., 0].reshape(-1))
                 col_loss = ce(out["col_logits"].reshape(-1, batch.d), pos_future[..., 1].reshape(-1))
                 loss = lambda_xy * (row_loss + col_loss)
+
                 if predict_pk:
                     loss = loss + lambda_p * mse(out["p_pred"], p_true)
                     loss = loss + lambda_k * mse(out["k_pred"], k_true)
-                val_loss_total += loss.item() * frames_obs.size(0)
+
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.detach() * frames_obs.size(0)
+
+        train_loss = total_loss.item() / len(train_set)
+
+        # ---- validation ----
+        model.eval()
+        val_loss_total = torch.zeros((), device=device)
+        correct = torch.zeros((), device=device, dtype=torch.long)
+        count = 0
+        p_abs_err = torch.zeros((), device=device)
+        k_abs_err = torch.zeros((), device=device)
+        n_pk = 0
+        with torch.no_grad():
+            for frames_obs, pos_future, p_true, k_true in val_loader:
+                frames_obs = frames_obs.to(device, non_blocking=True)
+                pos_future = pos_future.to(device, non_blocking=True)
+                p_true = p_true.to(device, non_blocking=True)
+                k_true = k_true.to(device, non_blocking=True)
+
+                with torch.autocast(device_type="cuda", enabled=amp_enabled):
+                    out = model(frames_obs, t_future)
+                    row_loss = ce(out["row_logits"].reshape(-1, batch.d), pos_future[..., 0].reshape(-1))
+                    col_loss = ce(out["col_logits"].reshape(-1, batch.d), pos_future[..., 1].reshape(-1))
+                    loss = lambda_xy * (row_loss + col_loss)
+                    if predict_pk:
+                        loss = loss + lambda_p * mse(out["p_pred"], p_true)
+                        loss = loss + lambda_k * mse(out["k_pred"], k_true)
+                val_loss_total += loss.detach() * frames_obs.size(0)
 
                 row_pred = out["row_logits"].argmax(-1)
                 col_pred = out["col_logits"].argmax(-1)
-                correct += ((row_pred == pos_future[..., 0]) & (col_pred == pos_future[..., 1])).sum().item()
+                correct += ((row_pred == pos_future[..., 0]) & (col_pred == pos_future[..., 1])).sum()
                 count += pos_future[..., 0].numel()
 
                 if predict_pk:
-                    p_abs_err += (out["p_pred"] - p_true).abs().sum().item()
-                    k_abs_err += (out["k_pred"] - k_true).abs().sum().item()
+                    p_abs_err += (out["p_pred"] - p_true).abs().sum()
+                    k_abs_err += (out["k_pred"] - k_true).abs().sum()
                     n_pk += p_true.numel()
 
-        val_loss = val_loss_total / len(val_set)
-        val_acc = correct / count
+        val_loss = val_loss_total.item() / len(val_set)
+        val_acc = correct.item() / count
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_xy_acc"].append(val_acc)
@@ -184,8 +204,8 @@ def run_training(
                f"val_loss {val_loss:.4f} | val_xy_exact_acc {val_acc:.3f} | "
                f"{time.time()-t0:.1f}s")
         if predict_pk:
-            p_mae = p_abs_err / n_pk
-            k_mae = k_abs_err / n_pk
+            p_mae = p_abs_err.item() / n_pk
+            k_mae = k_abs_err.item() / n_pk
             history["val_p_mae"].append(p_mae)
             history["val_k_mae"].append(k_mae)
             msg += f" | val_p_MAE {p_mae:.4f} | val_k_MAE {k_mae:.4f}"

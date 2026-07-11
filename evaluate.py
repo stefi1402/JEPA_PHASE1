@@ -17,7 +17,6 @@ from __future__ import annotations
 import os
 import numpy as np
 import torch
-import torch.nn as nn
 
 from dataset import generate_dataset
 from model import DotTransformer
@@ -40,57 +39,67 @@ def load_model(model_path: str, device: str = None):
     return model, cfg, device
 
 
-@torch.no_grad()
-def evaluate_on_batch(model, cfg, device, batch, batch_size=4):
+@torch.inference_mode()
+def evaluate_on_batch(model, cfg, device, batch, batch_size=4, num_workers=2):
     """Returns a dict of aggregate metrics for one SequenceBatch."""
     ds = WalkDataset(batch, cfg["t_obs"], cfg["t_future"])
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    use_cuda = str(device).startswith("cuda")
+    loader = DataLoader(
+        ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=use_cuda,
+        persistent_workers=num_workers > 0,
+    )
 
-    ce = nn.CrossEntropyLoss(reduction="sum")
-    total_correct, total_count = 0, 0
-    per_step_correct = np.zeros(cfg["t_future"])
-    p_abs_err, k_abs_err, n_pk = 0.0, 0.0, 0
+    # Accumulate on-device to avoid a host/device sync on every batch;
+    # convert to Python scalars once, after the loop.
+    total_correct = torch.zeros((), device=device, dtype=torch.long)
+    total_count = 0
+    per_step_correct = torch.zeros(cfg["t_future"], device=device)
+    p_abs_err = torch.zeros((), device=device)
+    k_abs_err = torch.zeros((), device=device)
+    n_pk = 0
     n_seq = 0
 
     for frames_obs, pos_future, p_true, k_true in loader:
-        frames_obs = frames_obs.to(device)
-        pos_future = pos_future.to(device)
-        p_true = p_true.to(device)
-        k_true = k_true.to(device)
+        frames_obs = frames_obs.to(device, non_blocking=True)
+        pos_future = pos_future.to(device, non_blocking=True)
+        p_true = p_true.to(device, non_blocking=True)
+        k_true = k_true.to(device, non_blocking=True)
 
         out = model(frames_obs, cfg["t_future"])
         row_pred = out["row_logits"].argmax(-1)
         col_pred = out["col_logits"].argmax(-1)
         exact = (row_pred == pos_future[..., 0]) & (col_pred == pos_future[..., 1])
 
-        total_correct += exact.sum().item()
+        total_correct += exact.sum()
         total_count += exact.numel()
-        per_step_correct += exact.float().sum(dim=0).cpu().numpy()
+        per_step_correct += exact.float().sum(dim=0)
         n_seq += frames_obs.size(0)
 
         if cfg["predict_pk"]:
-            p_abs_err += (out["p_pred"] - p_true).abs().sum().item()
-            k_abs_err += (out["k_pred"] - k_true).abs().sum().item()
+            p_abs_err += (out["p_pred"] - p_true).abs().sum()
+            k_abs_err += (out["k_pred"] - k_true).abs().sum()
             n_pk += p_true.numel()
 
     metrics = {
-        "exact_match_acc": total_correct / total_count,
-        "per_step_acc": per_step_correct / n_seq,
+        "exact_match_acc": total_correct.item() / total_count,
+        "per_step_acc": per_step_correct.cpu().numpy() / n_seq,
     }
     if cfg["predict_pk"]:
-        metrics["p_mae"] = p_abs_err / n_pk
-        metrics["k_mae"] = k_abs_err / n_pk
+        metrics["p_mae"] = p_abs_err.item() / n_pk
+        metrics["k_mae"] = k_abs_err.item() / n_pk
     return metrics
 
 
 def run_single_evaluation(model_path: str, n_sequences: int, p: float, k: int,
-                            out_dir: str = "eval_out", seed: int = 123, batch_size: int = 4):
+                            out_dir: str = "eval_out", seed: int = 123, batch_size: int = 4,
+                            num_workers: int = 2):
     os.makedirs(out_dir, exist_ok=True)
     model, cfg, device = load_model(model_path)
     seq_len = cfg["t_obs"] + cfg["t_future"]
     batch = generate_dataset(n_sequences=n_sequences, d=cfg["d"], seq_len=seq_len,
                                p=p, k=k, seed=seed)
-    metrics = evaluate_on_batch(model, cfg, device, batch, batch_size=batch_size)
+    metrics = evaluate_on_batch(model, cfg, device, batch, batch_size=batch_size, num_workers=num_workers)
 
     print(f"[eval] p={p} k={k} | exact_match_acc={metrics['exact_match_acc']:.3f}", end="")
     if "p_mae" in metrics:
@@ -108,7 +117,8 @@ def run_single_evaluation(model_path: str, n_sequences: int, p: float, k: int,
 
 
 def run_generalization_sweep(model_path: str, p_values, k_values, n_sequences: int = 200,
-                                out_dir: str = "generalize_out", seed: int = 123, batch_size: int = 4):
+                                out_dir: str = "generalize_out", seed: int = 123, batch_size: int = 4,
+                                num_workers: int = 2):
     """Evaluates the model across a grid of (p, k) values it may or may not
     have seen during training, to study generalization in p (and k)."""
     os.makedirs(out_dir, exist_ok=True)
@@ -122,7 +132,7 @@ def run_generalization_sweep(model_path: str, p_values, k_values, n_sequences: i
         for p in p_values:
             batch = generate_dataset(n_sequences=n_sequences, d=cfg["d"], seq_len=seq_len,
                                        p=p, k=k, seed=seed)
-            metrics = evaluate_on_batch(model, cfg, device, batch, batch_size=batch_size)
+            metrics = evaluate_on_batch(model, cfg, device, batch, batch_size=batch_size, num_workers=num_workers)
             accs.append(metrics["exact_match_acc"])
             p_maes.append(metrics.get("p_mae", np.nan))
             k_maes.append(metrics.get("k_mae", np.nan))

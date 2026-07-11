@@ -94,6 +94,8 @@ def cmd_train(args):
         val_split=args.val_split,
         seed=args.seed,
         viz_every=args.viz_every,
+        num_workers=args.num_workers,
+        amp=args.amp,
     )
 
 
@@ -106,6 +108,7 @@ def cmd_evaluate(args):
         out_dir=args.out_dir,
         seed=args.seed,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
     )
 
 
@@ -118,6 +121,7 @@ def cmd_generalize(args):
         out_dir=args.out_dir,
         seed=args.seed,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
     )
 
 
@@ -163,6 +167,9 @@ def build_parser():
     t.add_argument("--val_split", type=float, default=0.1)
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--viz_every", type=int, default=5, help="visualize a sample prediction every N epochs")
+    t.add_argument("--num_workers", type=int, default=2, help="DataLoader worker processes")
+    t.add_argument("--amp", action="store_true", default=True, help="use mixed precision on CUDA")
+    t.add_argument("--no_amp", dest="amp", action="store_false")
 
     # ---- evaluate ----
     e = sub.add_parser("evaluate", help="evaluate a trained model on a fresh test set at one (p, k)")
@@ -175,6 +182,7 @@ def build_parser():
     e.add_argument("--batch_size", type=int, default=4,
                     help="keep this small: sequence length is t_obs*d*d + t_future tokens, "
                          "so attention memory grows fast with batch_size")
+    e.add_argument("--num_workers", type=int, default=2, help="DataLoader worker processes")
 
     # ---- generalize ----
     gen = sub.add_parser("generalize", help="sweep p (and k) to study generalization / sensitivity")
@@ -185,6 +193,7 @@ def build_parser():
     gen.add_argument("--out_dir", type=str, default="generalize_out")
     gen.add_argument("--seed", type=int, default=123)
     gen.add_argument("--batch_size", type=int, default=4)
+    gen.add_argument("--num_workers", type=int, default=2, help="DataLoader worker processes")
 
     return parser
 
