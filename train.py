@@ -78,7 +78,14 @@ def run_training(
 ):
     os.makedirs(out_dir, exist_ok=True)
     torch.manual_seed(seed)
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    print(f"[info] training on device: {device}")
     use_cuda = device.startswith("cuda")
     # AMP only helps (and is only supported the same way) on CUDA.
     amp_enabled = amp and use_cuda

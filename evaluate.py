@@ -23,10 +23,18 @@ from model import DotTransformer
 from train import WalkDataset
 from torch.utils.data import DataLoader
 import viz
+from sheets_logger import log_eval_result, GSHEET_ENABLED, GSHEET_ID, GSHEET_CREDS_PATH, GSHEET_WORKSHEET
 
 
 def load_model(model_path: str, device: str = None):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    print(f"[info] evaluating on device: {device}")
     ckpt = torch.load(model_path, map_location=device)
     cfg = ckpt["config"]
     model = DotTransformer(
@@ -93,7 +101,9 @@ def evaluate_on_batch(model, cfg, device, batch, batch_size=4, num_workers=2):
 
 def run_single_evaluation(model_path: str, n_sequences: int, p: float, k: int,
                             out_dir: str = "eval_out", seed: int = 123, batch_size: int = 4,
-                            num_workers: int = 2):
+                            num_workers: int = 2, gsheet_enabled: bool = GSHEET_ENABLED,
+                            gsheet_id: str = GSHEET_ID, gsheet_creds: str = GSHEET_CREDS_PATH,
+                            gsheet_worksheet: str = GSHEET_WORKSHEET):
     os.makedirs(out_dir, exist_ok=True)
     model, cfg, device = load_model(model_path)
     seq_len = cfg["t_obs"] + cfg["t_future"]
@@ -107,6 +117,10 @@ def run_single_evaluation(model_path: str, n_sequences: int, p: float, k: int,
     else:
         print()
 
+    if gsheet_enabled:
+        log_eval_result(n_sequences, p, k, metrics, sheet_id=gsheet_id,
+                         creds_path=gsheet_creds, worksheet_name=gsheet_worksheet)
+
     viz.plot_sweep(
         list(range(cfg["t_future"])), metrics["per_step_acc"],
         xlabel="future timestep", ylabel="exact-match accuracy",
@@ -118,7 +132,9 @@ def run_single_evaluation(model_path: str, n_sequences: int, p: float, k: int,
 
 def run_generalization_sweep(model_path: str, p_values, k_values, n_sequences: int = 200,
                                 out_dir: str = "generalize_out", seed: int = 123, batch_size: int = 4,
-                                num_workers: int = 2):
+                                num_workers: int = 2, gsheet_enabled: bool = GSHEET_ENABLED,
+                                gsheet_id: str = GSHEET_ID, gsheet_creds: str = GSHEET_CREDS_PATH,
+                                gsheet_worksheet: str = GSHEET_WORKSHEET):
     """Evaluates the model across a grid of (p, k) values it may or may not
     have seen during training, to study generalization in p (and k)."""
     os.makedirs(out_dir, exist_ok=True)
@@ -141,6 +157,10 @@ def run_generalization_sweep(model_path: str, p_values, k_values, n_sequences: i
             results["p_mae"].append(metrics.get("p_mae", np.nan))
             results["k_mae"].append(metrics.get("k_mae", np.nan))
             print(f"[sweep] p={p} k={k} -> acc={metrics['exact_match_acc']:.3f}")
+
+            if gsheet_enabled:
+                log_eval_result(n_sequences, p, k, metrics, sheet_id=gsheet_id,
+                                 creds_path=gsheet_creds, worksheet_name=gsheet_worksheet)
 
         viz.plot_sweep(
             p_values, accs, xlabel="p", ylabel="exact-match accuracy",

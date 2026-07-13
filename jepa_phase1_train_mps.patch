@@ -1,0 +1,33 @@
+From 15fa0a07f5b636d9e12b2af3cb58d89501ced2e0 Mon Sep 17 00:00:00 2001
+From: a <a@a.com>
+Date: Mon, 13 Jul 2026 07:39:53 +0000
+Subject: [PATCH] Fix device selection in train.py to also detect MPS (Apple
+ Silicon), not just CUDA
+
+---
+ train.py | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/train.py b/train.py
+index 234c8f0..c39e1ce 100644
+--- a/train.py
++++ b/train.py
+@@ -78,7 +78,14 @@ def run_training(
+ ):
+     os.makedirs(out_dir, exist_ok=True)
+     torch.manual_seed(seed)
+-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
++    if device is None:
++        if torch.cuda.is_available():
++            device = "cuda"
++        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
++            device = "mps"
++        else:
++            device = "cpu"
++    print(f"[info] training on device: {device}")
+     use_cuda = device.startswith("cuda")
+     # AMP only helps (and is only supported the same way) on CUDA.
+     amp_enabled = amp and use_cuda
+-- 
+2.43.0
+

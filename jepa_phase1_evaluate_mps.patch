@@ -1,0 +1,33 @@
+From 467155313ebea4e8036c6e7cdf4d9e6459c79a04 Mon Sep 17 00:00:00 2001
+From: a <a@a.com>
+Date: Mon, 13 Jul 2026 07:40:31 +0000
+Subject: [PATCH] Fix device selection in evaluate.py's load_model to also
+ detect MPS
+
+---
+ evaluate.py | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/evaluate.py b/evaluate.py
+index 937e5ff..8501fc1 100644
+--- a/evaluate.py
++++ b/evaluate.py
+@@ -27,7 +27,14 @@ from sheets_logger import log_eval_result, GSHEET_ENABLED, GSHEET_ID, GSHEET_CRE
+ 
+ 
+ def load_model(model_path: str, device: str = None):
+-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
++    if device is None:
++        if torch.cuda.is_available():
++            device = "cuda"
++        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
++            device = "mps"
++        else:
++            device = "cpu"
++    print(f"[info] evaluating on device: {device}")
+     ckpt = torch.load(model_path, map_location=device)
+     cfg = ckpt["config"]
+     model = DotTransformer(
+-- 
+2.43.0
+
