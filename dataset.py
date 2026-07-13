@@ -33,6 +33,7 @@ To support both use cases this module can generate:
 from __future__ import annotations
 
 import numpy as np
+import os
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -156,6 +157,7 @@ def generate_dataset(
 
 
 def save_dataset(batch: SequenceBatch, path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     np.savez_compressed(
         path,
         frames=batch.frames,
