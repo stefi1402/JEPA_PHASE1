@@ -220,3 +220,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 gsheet_creds.json
+
+
+jepa-bw-service-account@continual-tine-424822-e5.iam.gserviceaccount.com
